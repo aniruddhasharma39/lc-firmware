@@ -572,6 +572,8 @@ bool mqttPublish(const String &topic, const String &payload) {
   Serial.print("AT< "); Serial.println(res);
   if (!ok(res)) {
     Serial.println("[MQTT][PUB][FAIL] Topic not accepted.");
+    mqttConnected = false;
+    mqttClientAcquired = false;
     return false;
   }
 
@@ -602,6 +604,8 @@ bool mqttPublish(const String &topic, const String &payload) {
   Serial.print("AT< "); Serial.println(res);
   if (!ok(res)) {
     Serial.println("[MQTT][PUB][FAIL] Payload not accepted.");
+    mqttConnected = false;
+    mqttClientAcquired = false;
     return false;
   }
 
@@ -1002,7 +1006,20 @@ void setup() {
 // Arduino loop()
 // -----------------------------------------------------------------------------
 void loop() {
-  // Reconnect check every 15 seconds if connection is lost
+  // 1. Process asynchronous incoming URCs from modem while idle
+  while (Modem.available()) {
+    String line = Modem.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      if (line.indexOf("+CMQTTCONNLOST") >= 0) {
+        Serial.printf("[MQTT][URC] Connection lost detected: %s\n", line.c_str());
+        mqttConnected = false;
+        mqttClientAcquired = false;
+      }
+    }
+  }
+
+  // 2. Reconnect check every 15 seconds if connection is lost
   if (!mqttConnected && (millis() - lastAttempt >= 15000)) {
     lastAttempt = millis();
     Serial.println("[LOOP] Reconnecting to AWS IoT Core...");
@@ -1015,8 +1032,8 @@ void loop() {
     }
   }
 
-  // Periodic heartbeat every 60 seconds while connected
-  if (mqttConnected && (millis() - lastTelemetry >= 60000)) {
+  // 3. Periodic heartbeat every 25 seconds while connected (keeps cellular carrier NAT warm)
+  if (mqttConnected && (millis() - lastTelemetry >= 25000)) {
     lastTelemetry = millis();
     publishGate("PeriodicHeartbeat");
   }
