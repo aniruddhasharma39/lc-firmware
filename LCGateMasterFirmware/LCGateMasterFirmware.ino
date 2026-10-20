@@ -203,6 +203,12 @@ String readAvailable(uint32_t waitMs = 300) {
   return s;
 }
 
+void wakeModem() {
+  Modem.print("AT\r\n");
+  delay(30);
+  while (Modem.available()) Modem.read();
+}
+
 static String pendingRxBuffer;
 
 String sendAT(const String &cmd, uint32_t timeout = 3000) {
@@ -544,6 +550,9 @@ bool mqttPublish(const String &topic, const String &payload) {
     Serial.println("[MQTT][PUB][SKIP] MQTT is not connected.");
     return false;
   }
+
+  // Ensure modem is awake if in sleep mode
+  wakeModem();
 
   // Step 1: Set Topic
   while (Modem.available()) Modem.read();
@@ -945,6 +954,29 @@ void publishGate(const char *triggerReason = nullptr) {
 }
 
 // -----------------------------------------------------------------------------
+// Power Optimization (Mode 1: Smart Low-Power Sleep)
+// -----------------------------------------------------------------------------
+static const uint32_t HEARTBEAT_OPEN_MS   = 25000;   // 25s when Gate is OPEN (high activity)
+static const uint32_t HEARTBEAT_CLOSED_MS = 300000;  // 5 minutes when Gate is CLOSED (low power)
+
+bool lowPowerActive = false;
+
+void applyPowerState(bool gateClosed) {
+  if (gateClosed && !lowPowerActive) {
+    lowPowerActive = true;
+    Serial.println("[POWER] Gate CLOSED -> Activating Low Power Mode (Modem CSCLK=2, CPU 80MHz, 5m Heartbeat)");
+    sendAT("AT+CSCLK=2", 2000);   // Modem enters autonomous sleep mode (drops from ~80mA to ~2mA)
+    setCpuFrequencyMhz(80);       // Reduce ESP32 CPU frequency to 80MHz (drops from ~55mA to ~15mA)
+  } else if (!gateClosed && lowPowerActive) {
+    lowPowerActive = false;
+    setCpuFrequencyMhz(240);      // Restore full 240MHz performance
+    wakeModem();
+    sendAT("AT+CSCLK=0", 2000);   // Wake modem to full active state
+    Serial.println("[POWER] Gate OPENED -> Restoring Full Power Mode (Modem CSCLK=0, CPU 240MHz, 25s Heartbeat)");
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Arduino setup()
 // -----------------------------------------------------------------------------
 void setup() {
@@ -1000,6 +1032,9 @@ void setup() {
   lastHallState  = isHallClosed() ? 1 : 0;
   publishGate("InitialState");
   lastTelemetry = millis();
+
+  // Apply initial power state based on physical gate position
+  applyPowerState(isClosed());
 }
 
 // -----------------------------------------------------------------------------
@@ -1023,6 +1058,9 @@ void loop() {
   if (!mqttConnected && (millis() - lastAttempt >= 15000)) {
     lastAttempt = millis();
     Serial.println("[LOOP] Reconnecting to AWS IoT Core...");
+    setCpuFrequencyMhz(240);
+    wakeModem();
+    sendAT("AT+CSCLK=0", 2000);
     if (ensureCellular()) {
       if (loadPermanent()) {
         connectPermanent();
@@ -1030,15 +1068,19 @@ void loop() {
         fleetProvision();
       }
     }
+    if (mqttConnected) {
+      applyPowerState(isClosed());
+    }
   }
 
-  // 3. Periodic heartbeat every 25 seconds while connected (keeps cellular carrier NAT warm)
-  if (mqttConnected && (millis() - lastTelemetry >= 25000)) {
+  // 3. Dynamic periodic heartbeat (25s when OPEN, 5 minutes when CLOSED)
+  uint32_t currentHeartbeatInterval = isClosed() ? HEARTBEAT_CLOSED_MS : HEARTBEAT_OPEN_MS;
+  if (mqttConnected && (millis() - lastTelemetry >= currentHeartbeatInterval)) {
     lastTelemetry = millis();
     publishGate("PeriodicHeartbeat");
   }
 
-  // Event-driven gate sensor state changes with debouncing
+  // 4. Event-driven gate sensor state changes with debouncing
   bool curLimit = isLimitClosed();
   bool curHall  = isHallClosed();
   int limitState = curLimit ? 1 : 0;
@@ -1055,6 +1097,13 @@ void loop() {
       lastLimitState = stableLimitState;
       lastHallState  = stableHallState;
       
+      bool currentlyClosed = stableLimit || stableHall;
+
+      // If opening, restore full power immediately before publishing
+      if (!currentlyClosed) {
+        applyPowerState(false);
+      }
+
       const char *reason = "SensorStateChanged";
       if (stableLimit && stableHall) {
         reason = "BothSensorsActive";
@@ -1066,7 +1115,12 @@ void loop() {
         reason = "GateOpened";
       }
       publishGate(reason);
+
+      // If closed, switch to low power mode after publishing confirmation
+      if (currentlyClosed) {
+        applyPowerState(true);
+      }
     }
   }
-  delay(50);
+  delay(lowPowerActive ? 100 : 50);
 }
