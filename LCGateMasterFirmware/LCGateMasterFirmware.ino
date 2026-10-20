@@ -180,7 +180,8 @@ String deviceCert, deviceKey, thingName;
 bool mqttConnected       = false;
 bool mqttServiceStarted   = false;
 bool mqttClientAcquired  = false;
-int  lastClosed          = -1;
+int  lastLimitState      = -1;
+int  lastHallState       = -1;
 uint32_t lastAttempt     = 0;
 uint32_t lastTelemetry   = 0;
 
@@ -886,27 +887,54 @@ bool connectPermanent() {
 }
 
 // -----------------------------------------------------------------------------
-// Gate Sensor Reading & Telemetry Publishing
+// Gate Sensor Reading & Telemetry Publishing (Option A: Dual Sensor Tracking)
 // -----------------------------------------------------------------------------
-bool isClosed() { 
-  return digitalRead(LIMIT_PIN) == LOW || digitalRead(HALL_PIN) == LOW; 
+bool isLimitClosed() {
+  return digitalRead(LIMIT_PIN) == LOW;
 }
 
-void publishGate(bool closed, const char *sensor) {
+bool isHallClosed() {
+  return digitalRead(HALL_PIN) == LOW;
+}
+
+bool isClosed() { 
+  return isLimitClosed() || isHallClosed(); 
+}
+
+void publishGate(const char *triggerReason = nullptr) {
   if (!mqttConnected) {
     Serial.println("[PUB][SKIP] MQTT is not connected.");
     return;
   }
+
+  bool limitClosed = isLimitClosed();
+  bool hallClosed  = isHallClosed();
+  bool closed      = limitClosed || hallClosed;
+
+  String sensorType;
+  if (limitClosed && hallClosed) {
+    sensorType = "Both";
+  } else if (limitClosed) {
+    sensorType = "LimitSwitch";
+  } else if (hallClosed) {
+    sensorType = "HallEffect";
+  } else {
+    sensorType = "None";
+  }
+
   String id = thingName.length() ? thingName : String(FACTORY_ID);
   String topic = String("lc-gate/") + id + "/telemetry";
   String state = closed ? "CLOSED" : "NOT_CLOSED";
   String payload = String("{\"MasterDeviceId\":\"") + id + 
                           "\",\"DeviceType\":\"LC_GATE_MASTER\"" +
                           ",\"Status\":\"" + state + "\"" +
-                          ",\"SensorType\":\"" + sensor + "\"" +
-                          ",\"LimitSwitchClosed\":" + (digitalRead(LIMIT_PIN) == LOW ? "true" : "false") + 
-                          ",\"HallClosed\":" + (digitalRead(HALL_PIN) == LOW ? "true" : "false") + 
+                          ",\"SensorType\":\"" + sensorType + "\"" +
+                          ",\"LimitSwitchClosed\":" + (limitClosed ? "true" : "false") + 
+                          ",\"HallClosed\":" + (hallClosed ? "true" : "false") + 
                           ",\"TimeStampMs\":" + String(millis()) + "}";
+  if (triggerReason != nullptr) {
+    Serial.printf("[EVENT] Gate trigger: %s (Sensor: %s, State: %s)\n", triggerReason, sensorType.c_str(), state.c_str());
+  }
   bool teleOk = mqttPublish(topic, payload);
   Serial.printf("[PUBLISH] telemetry=%s\n", teleOk ? "SUCCESS" : "FAILED");
   Serial.println(payload);
@@ -964,9 +992,9 @@ void setup() {
   }
 
   // 4. Initial state publish
-  int c = isClosed() ? 1 : 0; 
-  lastClosed = c; 
-  publishGate(c == 1, "InitialState");
+  lastLimitState = isLimitClosed() ? 1 : 0;
+  lastHallState  = isHallClosed() ? 1 : 0;
+  publishGate("InitialState");
   lastTelemetry = millis();
 }
 
@@ -990,18 +1018,37 @@ void loop() {
   // Periodic heartbeat every 60 seconds while connected
   if (mqttConnected && (millis() - lastTelemetry >= 60000)) {
     lastTelemetry = millis();
-    publishGate(isClosed(), "PeriodicHeartbeat");
+    publishGate("PeriodicHeartbeat");
   }
 
-  // Event-driven gate state changes with debouncing
-  bool closed = isClosed(); 
-  int state = closed ? 1 : 0;
-  if (state != lastClosed && mqttConnected) {
-    delay(80); 
-    bool stable = isClosed();
-    if (stable == closed) { 
-      publishGate(closed, (digitalRead(HALL_PIN) == LOW) ? "HallEffect" : "LimitSwitch"); 
-      lastClosed = state; 
+  // Event-driven gate sensor state changes with debouncing
+  bool curLimit = isLimitClosed();
+  bool curHall  = isHallClosed();
+  int limitState = curLimit ? 1 : 0;
+  int hallState  = curHall ? 1 : 0;
+
+  if ((limitState != lastLimitState || hallState != lastHallState) && mqttConnected) {
+    delay(80); // Debounce delay
+    bool stableLimit = isLimitClosed();
+    bool stableHall  = isHallClosed();
+    int stableLimitState = stableLimit ? 1 : 0;
+    int stableHallState  = stableHall ? 1 : 0;
+
+    if (stableLimitState != lastLimitState || stableHallState != lastHallState) {
+      lastLimitState = stableLimitState;
+      lastHallState  = stableHallState;
+      
+      const char *reason = "SensorStateChanged";
+      if (stableLimit && stableHall) {
+        reason = "BothSensorsActive";
+      } else if (stableLimit) {
+        reason = "LimitSwitchActive";
+      } else if (stableHall) {
+        reason = "HallEffectActive";
+      } else {
+        reason = "GateOpened";
+      }
+      publishGate(reason);
     }
   }
   delay(50);
