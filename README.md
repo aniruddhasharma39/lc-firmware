@@ -44,7 +44,7 @@ ERROR
 | **GPIO 18** | **Modem TXD** | ESP32 UART2 RX (Receives AT responses) |
 | **GPIO 17** | **Modem RXD** | ESP32 UART2 TX (Transmits AT commands) |
 | **GND** | **Modem GND** | **Mandatory Common Ground** |
-| **GPIO 23** | **Limit Switch** | Digital Input (HIGH = CLOSED). External 10kΩ pulldown resistor to GND. |
+| **GPIO 23** | **Limit Switch** | Digital Input (LOW = CLOSED). Configured with internal `INPUT_PULLUP`. |
 | **GPIO 22** | **Hall Sensor** | Digital Input (LOW = CLOSED). Configured with internal `INPUT_PULLUP`. |
 
 ### Critical Hardware Warnings:
@@ -61,7 +61,7 @@ ERROR
 
 ```mermaid
 flowchart TD
-    Boot([ESP32 Boot]) --> UART[Init UART2 @ 115200]
+    Boot([ESP32 Boot]) --> UART[Init UART2 @ 115200 with 16KB Buffer]
     UART --> CheckSIM[Check SIM: AT+CPIN?]
     CheckSIM --> Signal[Check Signal: AT+CSQ]
     Signal --> Reg[Check LTE: AT+CREG? / AT+CEREG?]
@@ -81,12 +81,28 @@ flowchart TD
     MQTTStart --> ClientAccq[AT+CMQTTACCQ=0,'LC-M-001',1 SSL]
     ClientAccq --> SSLBind[AT+CMQTTSSLCFG=0,0]
     SSLBind --> Connect[AT+CMQTTCONNECT to AWS IoT :8883]
-    Connect --> LiveLoop[Active Loop: Event + 60s Heartbeat]
+    Connect --> LiveLoop[Active Loop: Dual Sensors + Mode 1 Power Optimization]
 ```
 
 ---
 
-## 4. How to Test on AWS IoT Core
+## 4. Dual Sensor Tracking (Option A) & Mode 1 Power Optimization
+
+### Sensor States:
+| Limit Switch (GPIO 23) | Hall Sensor (GPIO 22) | Status | SensorType |
+| :---: | :---: | :---: | :---: |
+| **LOW (Active)** | **LOW (Active)** | `CLOSED` | `Both` *(Dual Confirmed)* |
+| **LOW (Active)** | HIGH (Inactive) | `CLOSED` | `LimitSwitch` |
+| HIGH (Inactive) | **LOW (Active)** | `CLOSED` | `HallEffect` |
+| HIGH (Inactive) | HIGH (Inactive) | `NOT_CLOSED` | `None` *(Gate Open)* |
+
+### Mode 1 Power Optimization:
+- **Gate CLOSED**: ESP32 scales CPU down to **80 MHz**, SIMCom modem enters autonomous sleep mode (`AT+CSCLK=2`, ~2 mA), and heartbeat relaxes to **5 minutes** (cutting 2A RF bursts by 92%).
+- **Gate OPENED**: Restores full **240 MHz** CPU clock, wakes modem (`AT+CSCLK=0`), publishes `NOT_CLOSED` immediately (< 1s), and maintains active **25s** heartbeat.
+
+---
+
+## 5. How to Test on AWS IoT Core
 
 1. Open the **AWS IoT Core Console**.
 2. Navigate to **MQTT test client**.
@@ -101,10 +117,10 @@ flowchart TD
      "MasterDeviceId": "LC-M-001",
      "DeviceType": "LC_GATE_MASTER",
      "Status": "CLOSED",
-     "SensorType": "InitialState",
+     "SensorType": "Both",
      "LimitSwitchClosed": true,
-     "HallClosed": false,
-     "TimeStampMs": 14502
+     "HallClosed": true,
+     "TimeStampMs": 75420
    }
    ```
-6. A periodic heartbeat is emitted every 60 seconds, and instant event updates are emitted whenever the limit switch or Hall effect sensor triggers.
+6. Instant event updates are emitted whenever either sensor triggers, and periodic heartbeats run continuously.
