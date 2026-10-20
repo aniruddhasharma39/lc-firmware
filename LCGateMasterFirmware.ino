@@ -288,9 +288,6 @@ bool configureTLS(const char *certFile, const char *keyFile) {
   good &= ok(sendAT(String("AT+CSSLCFG=\"cacert\",0,\"") + ROOT_CA_FILE + "\""));
   good &= ok(sendAT(String("AT+CSSLCFG=\"clientcert\",0,\"") + certFile + "\""));
   good &= ok(sendAT(String("AT+CSSLCFG=\"clientkey\",0,\"") + keyFile + "\""));
-  
-  // List certificates to verify they exist in modem storage
-  sendAT("AT+CCERTLIST", 3000);
   return good;
 }
 
@@ -354,7 +351,7 @@ bool ensureCellular() {
     return false;
   }
 
-  // CRITICAL STEP FOR SIMCom A7672S / A76XX: Open network socket service
+  // Open network socket service (NETOPEN)
   r = sendAT("AT+NETOPEN?", 3000);
   if (r.indexOf("+NETOPEN: 1") < 0) {
     Serial.println("[NET] Opening IP data bearer (AT+NETOPEN)...");
@@ -380,63 +377,39 @@ bool ensureCellular() {
 }
 
 // -----------------------------------------------------------------------------
-// MQTT EX Argument Mode Configuration
-// -----------------------------------------------------------------------------
-bool configureMqttEx() {
-  String r = sendAT("AT+CMQTTCFG=\"argtopic\",0,1,1", 5000);
-  if (!ok(r)) {
-    Serial.println(String("[MQTT][WARN] CMQTTCFG argtopic returned: ") + r);
-    return false;
-  }
-  return true;
-}
-
-// -----------------------------------------------------------------------------
-// MQTT Service & Client Initialization
+// MQTT Service & Client Initialization (Robust Lifecycle)
 // -----------------------------------------------------------------------------
 bool mqttStartClient() {
   Serial.println("[MQTT] Ensuring modem MQTT service/client state...");
 
-  // 1. Start MQTT service (or verify already active)
-  if (!mqttServiceStarted) {
-    String r = sendAT("AT+CMQTTSTART", 10000);
-    if (ok(r) || r.indexOf("+CMQTTSTART: 0") >= 0) {
-      mqttServiceStarted = true;
-      readAvailable(500);
-    } else if (r.indexOf("23") >= 0 || r.indexOf("ERROR") >= 0) {
-      Serial.println("[MQTT] Service already running on modem, proceeding to acquire client.");
-      mqttServiceStarted = true;
-    } else {
-      Serial.println("[MQTT][FAIL] Could not start MQTT service.");
-      return false;
-    }
+  // 1. Ensure MQTT service is started on modem
+  String r = sendAT("AT+CMQTTSTART", 5000);
+  if (ok(r) || r.indexOf("+CMQTTSTART: 0") >= 0) {
+    mqttServiceStarted = true;
+  } else if (r.indexOf("23") >= 0 || r.indexOf("ERROR") >= 0) {
+    // 23 = service already started
+    mqttServiceStarted = true;
   }
 
-  // 2. Acquire client 0 with server_type = 1 (SSL/TLS)
-  if (!mqttClientAcquired) {
-    String clientId = makeClientId();
-    String r = sendAT(String("AT+CMQTTACCQ=0,\"") + clientId + "\",1", 5000);
-    if (!ok(r)) {
-      Serial.println("[MQTT][WARN] ACCQ failed; releasing client 0 and retrying...");
-      sendAT("AT+CMQTTDISC=0,10", 3000);
-      sendAT("AT+CMQTTREL=0", 3000);
-      r = sendAT(String("AT+CMQTTACCQ=0,\"") + clientId + "\",1", 5000);
-    }
-    if (!ok(r)) {
-      Serial.println("[MQTT][FAIL] Could not acquire MQTT client 0 with SSL.");
-      return false;
-    }
-    mqttClientAcquired = true;
-  }
+  // 2. Always release any prior client 0 instance so we acquire fresh
+  sendAT("AT+CMQTTDISC=0,10", 2000);
+  sendAT("AT+CMQTTREL=0", 2000);
+  mqttClientAcquired = false;
 
-  // 3. Bind SSL context 0 to MQTT client 0
+  // 3. Acquire client 0 with server_type = 1 (SSL/TLS)
+  String clientId = makeClientId();
+  r = sendAT(String("AT+CMQTTACCQ=0,\"") + clientId + "\",1", 5000);
+  if (!ok(r)) {
+    Serial.println("[MQTT][FAIL] Could not acquire MQTT client 0 with SSL.");
+    return false;
+  }
+  mqttClientAcquired = true;
+
+  // 4. Bind SSL context 0 to MQTT client 0
   if (!ok(sendAT("AT+CMQTTSSLCFG=0,0", 5000))) {
     Serial.println("[MQTT][FAIL] Could not bind SSL context 0 to MQTT client 0.");
     return false;
   }
-
-  // 4. Configure argtopic mode
-  configureMqttEx();
 
   return true;
 }
@@ -452,6 +425,8 @@ bool mqttConnect(bool ssl) {
   String r = sendAT(cmd, 30000);
   if (r.indexOf("ERROR") >= 0 || r.indexOf("+CME ERROR") >= 0) {
     Serial.println("[MQTT][FAIL] CMQTTCONNECT command rejected immediately.");
+    mqttConnected = false;
+    mqttClientAcquired = false;
     return false;
   }
   if (r.indexOf("+CMQTTCONNECT: 0,0") >= 0) { 
@@ -477,54 +452,134 @@ bool mqttConnect(bool ssl) {
     if (urc.indexOf("+CMQTTCONNECT:") >= 0 && urc.indexOf(",0") < 0) {
       Serial.println(urc);
       Serial.println("[MQTT][FAIL] Connection rejected by broker (Check certs, policy, client ID, and SNI).");
+      mqttConnected = false;
+      mqttClientAcquired = false;
       break;
     }
     delay(20);
   }
   if (!mqttConnected) {
     Serial.println("[MQTT][FAIL] No successful +CMQTTCONNECT: 0,0 received within timeout.");
+    mqttClientAcquired = false;
   }
   return mqttConnected;
 }
 
 // -----------------------------------------------------------------------------
-// MQTT Publish & Subscribe
+// MQTT Publish (Standard SIMCom 3-Step Sequence: TOPIC -> PAYLOAD -> PUB)
 // -----------------------------------------------------------------------------
-bool mqttSubscribe(const String &topic) {
-  Serial.println(String("[MQTT][SUB] Subscribing to: ") + topic);
-  String cmd = String("AT+CMQTTSUB=0,\"") + topic + "\",1";
-  String r = sendAT(cmd, 15000);
-  if (r.indexOf("ERROR") >= 0 || r.indexOf("+CME ERROR") >= 0) {
-    Serial.println(String("[MQTT][SUB][FAIL] Command rejected: ") + r);
-    return false;
-  }
-  if (r.indexOf("+CMQTTSUB: 0,0") >= 0) return true;
-  String urc = readAvailable(10000);
-  Serial.print(urc);
-  return urc.indexOf("+CMQTTSUB: 0,0") >= 0;
-}
-
 bool mqttPublish(const String &topic, const String &payload) {
   if (!mqttConnected) {
     Serial.println("[MQTT][PUB][SKIP] MQTT is not connected.");
     return false;
   }
-  String cmd = String("AT+CMQTTPUB=0,\"") + topic + "\",1," + String(payload.length()) + ",0";
-  String r = sendAT(cmd, 10000);
-  if (r.indexOf('>') < 0) {
-    Serial.println(String("[MQTT][PUB][FAIL] No payload prompt for ") + topic + ": " + r);
-    if (r.indexOf("+CMQTTCONNLOST:") >= 0) mqttConnected = false;
+
+  // Step 1: Set Topic
+  while (Modem.available()) Modem.read();
+  String cmdTopic = String("AT+CMQTTTOPIC=0,") + topic.length();
+  Serial.print("AT> "); Serial.println(cmdTopic);
+  Modem.print(cmdTopic); Modem.print("\r\n");
+
+  uint32_t t = millis();
+  bool gotPrompt = false;
+  while (millis() - t < 3000) {
+    if (Modem.find('>')) { gotPrompt = true; break; }
+    delay(2);
+  }
+  if (!gotPrompt) {
+    Serial.println("[MQTT][PUB][FAIL] No '>' prompt for topic.");
+    mqttConnected = false;
+    mqttClientAcquired = false;
+    return false;
+  }
+  Modem.print(topic);
+  String res = readAvailable(3000);
+  Serial.print("AT< "); Serial.println(res);
+  if (!ok(res)) {
+    Serial.println("[MQTT][PUB][FAIL] Topic not accepted.");
+    return false;
+  }
+
+  // Step 2: Set Payload
+  while (Modem.available()) Modem.read();
+  String cmdPayload = String("AT+CMQTTPAYLOAD=0,") + payload.length();
+  Serial.print("AT> "); Serial.println(cmdPayload);
+  Modem.print(cmdPayload); Modem.print("\r\n");
+
+  t = millis();
+  gotPrompt = false;
+  while (millis() - t < 3000) {
+    if (Modem.find('>')) { gotPrompt = true; break; }
+    delay(2);
+  }
+  if (!gotPrompt) {
+    Serial.println("[MQTT][PUB][FAIL] No '>' prompt for payload.");
+    mqttConnected = false;
+    mqttClientAcquired = false;
     return false;
   }
   Modem.print(payload);
-  String response = readAvailable(15000);
-  Serial.print("[MQTT][PUB] Result: "); Serial.println(response);
-  if (response.indexOf("+CMQTTPUB: 0,0") >= 0) return true;
-  if (response.indexOf("+CMQTTCONNLOST:") >= 0) mqttConnected = false;
+  res = readAvailable(3000);
+  Serial.print("AT< "); Serial.println(res);
+  if (!ok(res)) {
+    Serial.println("[MQTT][PUB][FAIL] Payload not accepted.");
+    return false;
+  }
+
+  // Step 3: Trigger Publish (QoS 0: instant delivery to broker, no PUBACK wait)
+  String cmdPub = "AT+CMQTTPUB=0,0,60";
+  res = sendAT(cmdPub, 10000);
+  if (res.indexOf("ERROR") >= 0 || res.indexOf("+CMQTTCONNLOST") >= 0) {
+    Serial.println("[MQTT][PUB][FAIL] Publish failed or connection lost.");
+    mqttConnected = false;
+    mqttClientAcquired = false;
+    return false;
+  }
+
+  if (res.indexOf("+CMQTTPUB: 0,0") >= 0) {
+    Serial.println("[MQTT][PUB][SUCCESS] Message published successfully!");
+    return true;
+  }
+  
   String urc = readAvailable(5000);
   Serial.print(urc);
-  if (urc.indexOf("+CMQTTCONNLOST:") >= 0) mqttConnected = false;
-  return urc.indexOf("+CMQTTPUB: 0,0") >= 0;
+  if (urc.indexOf("+CMQTTCONNLOST") >= 0) {
+    mqttConnected = false;
+    mqttClientAcquired = false;
+    return false;
+  }
+  if (urc.indexOf("+CMQTTPUB: 0,0") >= 0) {
+    Serial.println("[MQTT][PUB][SUCCESS] Message published successfully!");
+    return true;
+  }
+
+  return (res.indexOf("OK") >= 0);
+}
+
+// -----------------------------------------------------------------------------
+// MQTT Subscribe (Standard SIMCom SUBTOPIC -> SUB)
+// -----------------------------------------------------------------------------
+bool mqttSubscribe(const String &topic) {
+  Serial.println(String("[MQTT][SUB] Subscribing to: ") + topic);
+  while (Modem.available()) Modem.read();
+  String cmd = String("AT+CMQTTSUBTOPIC=0,") + topic.length() + ",1";
+  Serial.print("AT> "); Serial.println(cmd);
+  Modem.print(cmd); Modem.print("\r\n");
+
+  uint32_t t = millis();
+  bool gotPrompt = false;
+  while (millis() - t < 3000) {
+    if (Modem.find('>')) { gotPrompt = true; break; }
+    delay(2);
+  }
+  if (!gotPrompt) return false;
+  Modem.print(topic);
+  String res = readAvailable(3000);
+  Serial.print("AT< "); Serial.println(res);
+  if (!ok(res)) return false;
+
+  String r = sendAT("AT+CMQTTSUB=0", 15000);
+  return ok(r) || r.indexOf("+CMQTTSUB: 0,0") >= 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -636,9 +691,19 @@ bool loadPermanent() {
 // -----------------------------------------------------------------------------
 bool connectPermanent() {
   Serial.println("[AWS] Setting up permanent device TLS session...");
-  if (!downloadToModem(ROOT_CA_FILE, ROOT_CA)) return false;
-  if (!downloadRamToModem(DEVICE_CERT_FILE, deviceCert)) return false;
-  if (!downloadRamToModem(DEVICE_KEY_FILE, deviceKey)) return false;
+  
+  // Check if certificates are already present in modem flash
+  String certList = sendAT("AT+CCERTLIST", 3000);
+  if (certList.indexOf(ROOT_CA_FILE) < 0) {
+    if (!downloadToModem(ROOT_CA_FILE, ROOT_CA)) return false;
+  }
+  if (certList.indexOf(DEVICE_CERT_FILE) < 0) {
+    if (!downloadRamToModem(DEVICE_CERT_FILE, deviceCert)) return false;
+  }
+  if (certList.indexOf(DEVICE_KEY_FILE) < 0) {
+    if (!downloadRamToModem(DEVICE_KEY_FILE, deviceKey)) return false;
+  }
+
   if (!configureTLS(DEVICE_CERT_FILE, DEVICE_KEY_FILE)) return false;
   if (!mqttStartClient() || !mqttConnect(true)) return false;
   
@@ -699,7 +764,7 @@ void setup() {
 
   // 1. Bring up cellular network & open IP socket bearer (NETOPEN)
   if (!ensureCellular()) { 
-    Serial.println("[INIT][FAIL] Cellular setup failed; will retry in 30 seconds."); 
+    Serial.println("[INIT][FAIL] Cellular setup failed; will retry in 15 seconds."); 
     lastAttempt = millis(); 
     return; 
   }
@@ -709,7 +774,7 @@ void setup() {
   if (!provisioned) {
     Serial.println("[PROV] No device credentials found. Attempting Fleet Provisioning...");
     if (!fleetProvision()) { 
-      Serial.println("[PROV][FAIL] Fleet provisioning failed. Will retry in 30s."); 
+      Serial.println("[PROV][FAIL] Fleet provisioning failed. Will retry in 15s."); 
       lastAttempt = millis();
       return; 
     }
@@ -717,7 +782,7 @@ void setup() {
 
   // 3. Connect to AWS IoT Core over TLS
   if (!connectPermanent()) { 
-    Serial.println("[AWS][FAIL] Permanent AWS TLS/MQTT connect failed; will retry in 30s."); 
+    Serial.println("[AWS][FAIL] Permanent AWS TLS/MQTT connect failed; will retry in 15s."); 
     lastAttempt = millis();
     return; 
   }
@@ -733,8 +798,8 @@ void setup() {
 // Arduino loop()
 // -----------------------------------------------------------------------------
 void loop() {
-  // Reconnect check every 30 seconds if connection is lost
-  if (!mqttConnected && (millis() - lastAttempt >= 30000)) {
+  // Reconnect check every 15 seconds if connection is lost
+  if (!mqttConnected && (millis() - lastAttempt >= 15000)) {
     lastAttempt = millis();
     Serial.println("[LOOP] Reconnecting to AWS IoT Core...");
     if (ensureCellular()) {
