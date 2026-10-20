@@ -702,11 +702,12 @@ bool fleetProvision() {
 
   // 4. Subscribe to certificate creation and provisioning topics
   Serial.println("[PROV] Subscribing to AWS provisioning topics...");
-  if (!mqttSubscribe("$aws/certificates/create/json/accepted") ||
-      !mqttSubscribe("$aws/certificates/create/json/rejected") ||
-      !mqttSubscribe(String("$aws/provisioning-templates/") + TEMPLATE_NAME + "/provision/json/accepted") ||
-      !mqttSubscribe(String("$aws/provisioning-templates/") + TEMPLATE_NAME + "/provision/json/rejected")) {
-    Serial.println("[PROV][FAIL] Failed to subscribe to provisioning topics.");
+  bool s1 = mqttSubscribe("$aws/certificates/create/json/accepted"); delay(400);
+  bool s2 = mqttSubscribe("$aws/certificates/create/json/rejected"); delay(400);
+  bool s3 = mqttSubscribe(String("$aws/provisioning-templates/") + TEMPLATE_NAME + "/provision/json/accepted"); delay(400);
+  bool s4 = mqttSubscribe(String("$aws/provisioning-templates/") + TEMPLATE_NAME + "/provision/json/rejected"); delay(400);
+  if (!s1 || !s2 || !s3 || !s4) {
+    Serial.println("[PROV][FAIL] Failed to subscribe to all provisioning topics.");
     mqttDisconnect();
     return false;
   }
@@ -880,6 +881,7 @@ void setup() {
   Serial.printf("Target APN: %s\n", APN);
   Serial.printf("AWS Host:   %s\n", AWS_HOST);
 
+  Modem.setRxBufferSize(4096); // Expand RX buffer to handle 2KB+ AWS certificate payload
   Modem.begin(115200, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN); 
   delay(1500);
 
