@@ -6,7 +6,7 @@
     ESP32 UART2 RX = GPIO18  <--- Connected to Modem TXD
     ESP32 UART2 TX = GPIO17  ---> Connected to Modem RXD
     Baud rate: 115200 baud
-    GPIO23: Limit switch (HIGH = CLOSED, external 10k pulldown)
+    GPIO23: Limit switch (LOW = CLOSED, internal INPUT_PULLUP)
     GPIO22: Hall sensor (LOW = CLOSED, internal INPUT_PULLUP)
     GND: ESP32 GND directly connected to A7672S GND (Common Ground)
 
@@ -794,7 +794,8 @@ bool fleetProvision() {
   // 7. Register Thing via Provisioning Template
   Serial.println("[PROV] Executing Provisioning Template to create Thing in AWS IoT Core...");
   String registerPayload = String("{\"certificateOwnershipToken\":\"") + jsonEscape(token) + 
-                          "\",\"parameters\":{\"SerialNumber\":\"" + jsonEscape(serialNumber()) + "\"}}";
+                          "\",\"parameters\":{\"SerialNumber\":\"" + jsonEscape(serialNumber()) + 
+                          "\",\"MasterId\":\"" + jsonEscape(serialNumber()) + "\"}}";
   delay(1000);
   if (!mqttPublish(String("$aws/provisioning-templates/") + TEMPLATE_NAME + "/provision/json", registerPayload)) {
     Serial.println("[PROV][FAIL] Failed to publish register payload.");
@@ -888,7 +889,7 @@ bool connectPermanent() {
 // Gate Sensor Reading & Telemetry Publishing
 // -----------------------------------------------------------------------------
 bool isClosed() { 
-  return digitalRead(LIMIT_PIN) == HIGH || digitalRead(HALL_PIN) == LOW; 
+  return digitalRead(LIMIT_PIN) == LOW || digitalRead(HALL_PIN) == LOW; 
 }
 
 void publishGate(bool closed, const char *sensor) {
@@ -903,7 +904,7 @@ void publishGate(bool closed, const char *sensor) {
                           "\",\"DeviceType\":\"LC_GATE_MASTER\"" +
                           ",\"Status\":\"" + state + "\"" +
                           ",\"SensorType\":\"" + sensor + "\"" +
-                          ",\"LimitSwitchClosed\":" + (digitalRead(LIMIT_PIN) == HIGH ? "true" : "false") + 
+                          ",\"LimitSwitchClosed\":" + (digitalRead(LIMIT_PIN) == LOW ? "true" : "false") + 
                           ",\"HallClosed\":" + (digitalRead(HALL_PIN) == LOW ? "true" : "false") + 
                           ",\"TimeStampMs\":" + String(millis()) + "}";
   bool teleOk = mqttPublish(topic, payload);
@@ -918,7 +919,7 @@ void setup() {
   Serial.begin(115200); 
   delay(1000);
 
-  pinMode(LIMIT_PIN, INPUT); 
+  pinMode(LIMIT_PIN, INPUT_PULLUP); 
   pinMode(HALL_PIN, INPUT_PULLUP);
 
   Serial.println();
