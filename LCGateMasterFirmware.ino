@@ -276,9 +276,7 @@ String jsonGet(const String &j, const String &key) {
 }
 
 String serialNumber() { 
-  String s = String(FACTORY_ID);
-  if (s.startsWith("LC-M-")) return s.substring(5);
-  return s; 
+  return String(FACTORY_ID); 
 }
 String makeClientId() { 
   if (thingName.length() > 0) return thingName;
