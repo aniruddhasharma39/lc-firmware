@@ -202,6 +202,8 @@ String readAvailable(uint32_t waitMs = 300) {
   return s;
 }
 
+static String pendingRxBuffer;
+
 String sendAT(const String &cmd, uint32_t timeout = 3000) {
   while (Modem.available()) Modem.read();
   Serial.print("AT> "); Serial.println(cmd);
@@ -218,6 +220,12 @@ String sendAT(const String &cmd, uint32_t timeout = 3000) {
     delay(2);
   }
   Serial.print("AT< "); Serial.println(out);
+
+  int rxPos = out.indexOf("+CMQTTRX");
+  if (rxPos >= 0) {
+    pendingRxBuffer += out.substring(rxPos);
+  }
+
   return out;
 }
 
@@ -247,6 +255,7 @@ String jsonGet(const String &j, const String &key) {
   if (p >= j.length() || j[p] != '"') return ""; 
   p++;
   String out; 
+  out.reserve(j.length() > 256 ? 2048 : 64);
   bool esc = false;
   for (; p < j.length(); p++) {
     char c = j[p]; 
@@ -266,13 +275,21 @@ String jsonGet(const String &j, const String &key) {
   return out;
 }
 
-String serialNumber() { return String(FACTORY_ID); }
-String makeClientId() { return serialNumber(); }
+String serialNumber() { 
+  String s = String(FACTORY_ID);
+  if (s.startsWith("LC-M-")) return s.substring(5);
+  return s; 
+}
+String makeClientId() { 
+  if (thingName.length() > 0) return thingName;
+  return String(FACTORY_ID); 
+}
 
 // -----------------------------------------------------------------------------
 // Certificate Management
 // -----------------------------------------------------------------------------
 bool downloadToModem(const char *filename, const char *data) {
+  sendAT(String("AT+CCERTDELE=\"") + filename + "\"", 2000);
   size_t len = strlen_P(data);
   String cmd = String("AT+CCERTDOWN=\"") + filename + "\"," + String((unsigned long)len);
   while (Modem.available()) Modem.read();
@@ -297,6 +314,7 @@ bool downloadToModem(const char *filename, const char *data) {
 }
 
 bool downloadRamToModem(const char *filename, const String &data) {
+  sendAT(String("AT+CCERTDELE=\"") + filename + "\"", 2000);
   String cmd = String("AT+CCERTDOWN=\"") + filename + "\"," + String(data.length());
   while (Modem.available()) Modem.read();
   Modem.println(cmd);
@@ -605,6 +623,10 @@ bool mqttPublish(const String &topic, const String &payload) {
   
   String urc = readAvailable(5000);
   Serial.print(urc);
+  int rxPos = urc.indexOf("+CMQTTRX");
+  if (rxPos >= 0) {
+    pendingRxBuffer += urc.substring(rxPos);
+  }
   if (urc.indexOf("+CMQTTCONNLOST") >= 0) {
     mqttConnected = false;
     mqttClientAcquired = false;
@@ -649,32 +671,57 @@ bool mqttSubscribe(const String &topic) {
 }
 
 // -----------------------------------------------------------------------------
-// Fleet Provisioning JSON Wait Helper
+// Fleet Provisioning JSON Wait Helper (High Performance UART Drain)
 // -----------------------------------------------------------------------------
 String waitForJson(uint32_t timeoutMs) {
-  String all; 
-  all.reserve(4096);
+  String all = pendingRxBuffer; 
+  pendingRxBuffer = "";
+  all.reserve(16384);
+
   uint32_t start = millis();
+  uint32_t lastByteTime = millis();
+  bool rxStarted = (all.length() > 0);
+
+  Serial.println("[JSON] Awaiting AWS response stream...");
+
   while (millis() - start < timeoutMs) {
     while (Modem.available()) {
       char c = (char)Modem.read();
       all += c;
+      lastByteTime = millis();
+      rxStarted = true;
     }
-    int a = all.indexOf('{');
-    int end = all.lastIndexOf('}');
-    if (a >= 0 && end > a) { 
-      String candidate = all.substring(a, end + 1);
-      if (candidate.indexOf("certificateOwnershipToken") >= 0 ||
-          candidate.indexOf("certificatePem") >= 0 ||
-          candidate.indexOf("thingName") >= 0 ||
-          candidate.indexOf("errorMessage") >= 0) {
-        return candidate;
+
+    if (rxStarted) {
+      // 1. Packet complete indicator from modem
+      if (all.indexOf("+CMQTTRXEND") >= 0) {
+        break;
+      }
+      // 2. Or closing brace present and no more bytes for 350ms
+      if ((millis() - lastByteTime > 350) && all.indexOf('{') >= 0 && all.lastIndexOf('}') > all.indexOf('{')) {
+        break;
       }
     }
-    delay(5);
+    delay(2);
   }
-  Serial.println("Timeout or raw response received:");
-  Serial.println(all);
+
+  // Parse JSON candidate once stream is complete
+  int a = all.indexOf('{');
+  int end = all.lastIndexOf('}');
+  if (a >= 0 && end > a) { 
+    String candidate = all.substring(a, end + 1);
+    if (candidate.indexOf("certificateOwnershipToken") >= 0 ||
+        candidate.indexOf("certificatePem") >= 0 ||
+        candidate.indexOf("thingName") >= 0 ||
+        candidate.indexOf("errorMessage") >= 0) {
+      return candidate;
+    }
+  }
+
+  Serial.println("[JSON][WARN] Incomplete or timed out response. Buffer length: " + String(all.length()));
+  if (all.length() > 0) {
+    Serial.println(all);
+  }
   return "";
 }
 
@@ -769,7 +816,7 @@ bool fleetProvision() {
       mqttDisconnect();
       return false;
     }
-    thingName = serialNumber();
+    thingName = String(FACTORY_ID);
   }
 
   // 9. Save newly provisioned credentials to ESP32 Flash (NVS Preferences)
@@ -885,7 +932,7 @@ void setup() {
   Serial.printf("Target APN: %s\n", APN);
   Serial.printf("AWS Host:   %s\n", AWS_HOST);
 
-  Modem.setRxBufferSize(4096); // Expand RX buffer to handle 2KB+ AWS certificate payload
+  Modem.setRxBufferSize(16384); // Expand RX buffer to 16KB to safely hold large AWS TLS certificates
   Modem.begin(115200, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN); 
   delay(1500);
 
