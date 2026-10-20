@@ -653,19 +653,23 @@ bool mqttSubscribe(const String &topic) {
 // -----------------------------------------------------------------------------
 String waitForJson(uint32_t timeoutMs) {
   String all; 
+  all.reserve(4096);
   uint32_t start = millis();
   while (millis() - start < timeoutMs) {
     while (Modem.available()) {
       char c = (char)Modem.read();
       all += c;
     }
-    int a = all.indexOf("{\"certificateOwnershipToken\"");
-    if (a < 0) a = all.indexOf("{\"certificatePem\"");
-    if (a < 0) a = all.indexOf("{\"thingName\"");
-    if (a < 0) a = all.indexOf("{\"errorMessage\"");
-    if (a >= 0) { 
-      int end = all.lastIndexOf('}'); 
-      if (end > a) return all.substring(a, end + 1); 
+    int a = all.indexOf('{');
+    int end = all.lastIndexOf('}');
+    if (a >= 0 && end > a) { 
+      String candidate = all.substring(a, end + 1);
+      if (candidate.indexOf("certificateOwnershipToken") >= 0 ||
+          candidate.indexOf("certificatePem") >= 0 ||
+          candidate.indexOf("thingName") >= 0 ||
+          candidate.indexOf("errorMessage") >= 0) {
+        return candidate;
+      }
     }
     delay(5);
   }
